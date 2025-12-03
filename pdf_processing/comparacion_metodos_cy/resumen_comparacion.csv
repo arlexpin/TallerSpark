@@ -1,0 +1,7 @@
+Métrica,pdfplumber,pymupdf4llm
+Tiempo promedio (s),0.705,1.136
+Load Numbers encontrados (%),100.0%,100.0%
+Fechas promedio,2.27,2.27
+Direcciones promedio,4.60,4.27
+Score de ruido,0.00,63.74
+Dificultad parsing,BAJA,ALTA
