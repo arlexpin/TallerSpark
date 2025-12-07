@@ -105,7 +105,7 @@ target_df = spark.table(source_table)
 def normalize(df):
     string_cols = [c for c, t in df.dtypes if t == "string"]
     return df.select(*[
-        F.trim(F.lower(F.col(c))).alias(c) if c in string_cols else F.col(c)
+        F.trim(F.col(c)).alias(c) if c in string_cols else F.col(c)
         for c in df.columns
     ])
 
@@ -130,8 +130,8 @@ else:
     for col in schema.fieldNames():
         truth_val = truth_record.get(col)
         target_val = target_values.get(col)
-        norm_truth = str(truth_val).strip().lower() if truth_val else None
-        norm_target = str(target_val).strip().lower() if target_val else None
+        norm_truth = str(truth_val).strip() if truth_val else None
+        norm_target = str(target_val).strip() if target_val else None
         status = "✅ Match" if norm_truth == norm_target else "❌ Mismatch"
         results.append((col, status, truth_val, target_val))
 
