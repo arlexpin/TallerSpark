@@ -50,7 +50,7 @@ schema = T.StructType([T.StructField(f, T.StringType()) for f in fields])
 # 3️⃣ Ground Truth Record
 # ------------------------------------------------------------------------------
 truth_record = {
-    "source_file": "dbfs:/Volumes/logistics/bronze/raw/txt/source=UTB/1637351047899_UTB%20ME-FL-FL.txt",
+    "source_file": "dbfs:/Volumes/logistics/bronze/raw_txt/source=UTB/1637351047899_UTB%20ME-FL-FL.txt",
     "broker_name": "USA Truck Brokers Inc.",
     "broker_phone": "305-819-3000",
     "broker_fax": "305-819-7146",
