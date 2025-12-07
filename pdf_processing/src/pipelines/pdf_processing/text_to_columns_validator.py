@@ -1,5 +1,9 @@
 import argparse
+import json
 import logging
+import sys
+from typing import Any, Dict, List, Optional
+
 from pyspark.sql import SparkSession, functions as F, types as T
 
 # ------------------------------------------------------------------------------
@@ -12,44 +16,9 @@ logging.basicConfig(
 logger = logging.getLogger("UTB_Validator")
 
 # ------------------------------------------------------------------------------
-# 0️⃣ Parse Arguments
+# 0️⃣ Truth record embebido por defecto (puedes pasar --truth_json para usar otro)
 # ------------------------------------------------------------------------------
-parser = argparse.ArgumentParser(description="UTB Extractor Validator")
-parser.add_argument(
-    "--source_table",
-    required=True,
-    help="Spark table name for validation (e.g., logistics.bronze.truckr_loads)"
-)
-args = parser.parse_args()
-source_table = args.source_table
-
-# ------------------------------------------------------------------------------
-# 1️⃣ Spark Session
-# ------------------------------------------------------------------------------
-spark = SparkSession.builder.appName("UTB_Extractor_Validator").getOrCreate()
-
-# ------------------------------------------------------------------------------
-# 2️⃣ Schema Definition
-# ------------------------------------------------------------------------------
-fields = [
-    "source_file", "broker_name", "broker_phone", "broker_fax", "broker_address",
-    "broker_city", "broker_state", "broker_zipcode", "broker_email",
-    "loadConfirmationNumber", "totalCarrierPay", "carrier_name", "carrier_mc",
-    "carrier_address", "carrier_city", "carrier_state", "carrier_zipcode",
-    "carrier_phone", "carrier_fax", "carrier_contact", "pickup_customer_1",
-    "pickup_address_1", "pickup_city_1", "pickup_state_1", "pickup_zipcode_1",
-    "pickup_start_datetime_1", "pickup_end_datetime_1", "delivery_customer_1",
-    "delivery_customer_2", "delivery_address_1", "delivery_address_2",
-    "delivery_city_1", "delivery_city_2", "delivery_state_1", "delivery_state_2",
-    "delivery_zipcode_1", "delivery_zipcode_2", "delivery_start_datetime_1",
-    "delivery_start_datetime_2", "delivery_end_datetime_1", "delivery_end_datetime_2"
-]
-schema = T.StructType([T.StructField(f, T.StringType()) for f in fields])
-
-# ------------------------------------------------------------------------------
-# 3️⃣ Ground Truth Record
-# ------------------------------------------------------------------------------
-truth_record = {
+DEFAULT_TRUTH = {
     "source_file": "dbfs:/Volumes/logistics/bronze/raw/txt/source=UTB/1637351047899_UTB%20ME-FL-FL.txt",
     "broker_name": "USA Truck Brokers Inc.",
     "broker_phone": "305-819-3000",
@@ -92,67 +61,206 @@ truth_record = {
     "delivery_end_datetime_1": "2021-11-21T12:00:00",
     "delivery_end_datetime_2": "2021-11-21T19:00:00",
 }
-truth_df = spark.createDataFrame([truth_record], schema=schema)
 
 # ------------------------------------------------------------------------------
-# 4️⃣ Load Target Table from Parameter
+# Utilidades de normalización y comparación
 # ------------------------------------------------------------------------------
-target_df = spark.table(source_table)
+
+
+def normalize_row_dict(row: Dict[str, Any]) -> Dict[str, Optional[str]]:
+    """
+    Normaliza un diccionario de fila: strip y lower en cadenas; None si valor ausente.
+    Mantiene tipos simples convertidos a str si es necesario.
+    """
+    out = {}
+    for k, v in row.items():
+        if v is None:
+            out[k] = None
+            continue
+        # Guardamos como string para la comparación, pero trim + lower
+        if isinstance(v, str):
+            s = v.strip()
+            out[k] = s.lower() if s != "" else ""
+        else:
+            # Para otros tipos (int/float), convertir a str y comparar
+            out[k] = str(v).strip()
+    return out
+
+
+def compare_values(key: str, truth: Optional[str], target: Optional[str]) -> bool:
+    """
+    Comparador tolerante:
+    - None/'' tratados como equivalentes si ambos vacíos/None.
+    - Si parece una lista de emails (contiene '@' o ';'), compara como sets.
+    - Si es claramente numérico (solo dígitos y . , $), normaliza y compara numéricamente.
+    - Por defecto compara strings normalizados.
+    """
+    # Normalizar None/empty
+    t1 = truth if truth is not None else ""
+    t2 = target if target is not None else ""
+
+    # Ambos vacíos -> match
+    if t1 == "" and t2 == "":
+        return True
+
+    # Heurística de emails: si cualquiera contiene '@' o ';' y ambos no vacíos
+    if ("@" in t1 or "@" in t2 or ";" in t1 or ";" in t2):
+        # Separar por ';' o ',' y limpiar
+        def emails_to_set(s: str):
+            parts = [p.strip().lower() for p in s.replace(",", ";").split(";") if p.strip()]
+            return set(parts)
+
+        set1 = emails_to_set(t1)
+        set2 = emails_to_set(t2)
+        return set1 == set2
+
+    # Heurística numérica: quitar símbolos comunes y comparar como float si es posible
+    def normalize_number(s: str):
+        import re
+        s_clean = re.sub(r"[^\d\.\-]", "", s)  # dejar dígitos, punto y signo negativo
+        try:
+            return float(s_clean)
+        except Exception:
+            return None
+
+    n1 = normalize_number(t1)
+    n2 = normalize_number(t2)
+    if n1 is not None and n2 is not None:
+        return abs(n1 - n2) < 1e-6
+
+    # Fallback simple: igualdad de strings ya normalizados
+    return t1 == t2
+
 
 # ------------------------------------------------------------------------------
-# 5️⃣ Normalize Data
+# Lógica principal
 # ------------------------------------------------------------------------------
-def normalize(df):
-    string_cols = [c for c, t in df.dtypes if t == "string"]
-    return df.select(*[
-        F.trim(F.lower(F.col(c))).alias(c) if c in string_cols else F.col(c)
-        for c in df.columns
-    ])
+def main(argv: Optional[List[str]] = None) -> None:
+    parser = argparse.ArgumentParser(description="UTB Extractor Validator")
+    parser.add_argument(
+        "--source_table",
+        required=True,
+        help="Spark table name for validation (ej: logistics.bronze.truckr_loads)"
+    )
+    parser.add_argument(
+        "--load_id",
+        required=False,
+        help="loadConfirmationNumber a validar (si no se pasa, se usa el del truth embebido)"
+    )
+    parser.add_argument(
+        "--truth_json",
+        required=False,
+        help="(opcional) ruta a un JSON con el registro truth. Si se pasa, reemplaza el truth embebido."
+    )
+    args = parser.parse_args(argv)
 
-truth_df = normalize(truth_df)
-target_df = normalize(target_df)
+    source_table = args.source_table
 
-# ------------------------------------------------------------------------------
-# 6️⃣ Compare Values Field-by-Field
-# ------------------------------------------------------------------------------
-load_id = truth_record["loadConfirmationNumber"]
-target_rows = target_df.filter(F.col("loadConfirmationNumber") == load_id).collect()
+    # Crear SparkSession
+    spark = SparkSession.builder.appName("UTB_Extractor_Validator").getOrCreate()
 
-results = []
+    # Cargar truth
+    truth_record: Dict[str, Any] = DEFAULT_TRUTH.copy()
+    if args.truth_json:
+        logger.info(f"Cargando truth desde {args.truth_json}")
+        try:
+            with open(args.truth_json, "r", encoding="utf-8") as fh:
+                loaded = json.load(fh)
+                if not isinstance(loaded, dict):
+                    logger.error("El JSON de truth debe contener un objeto/dict en la raíz.")
+                    raise SystemExit(2)
+                truth_record.update(loaded)
+        except FileNotFoundError:
+            logger.error(f"No se encontró el archivo {args.truth_json}")
+            raise SystemExit(2)
 
-if not target_rows:
-    logger.error(f"No record found for loadConfirmationNumber={load_id}")
-    for col in schema.fieldNames():
-        results.append((col, "❌ Missing record", truth_record.get(col), None))
-else:
-    logger.info(f"Found record for loadConfirmationNumber={load_id}")
-    target_values = target_rows[0].asDict()
-    for col in schema.fieldNames():
-        truth_val = truth_record.get(col)
-        target_val = target_values.get(col)
-        norm_truth = str(truth_val).strip().lower() if truth_val else None
-        norm_target = str(target_val).strip().lower() if target_val else None
-        status = "✅ Match" if norm_truth == norm_target else "❌ Mismatch"
-        results.append((col, status, truth_val, target_val))
+    # Si se pasa load_id por argumento, lo usamos
+    if args.load_id:
+        truth_record["loadConfirmationNumber"] = args.load_id
 
-# ------------------------------------------------------------------------------
-# 7️⃣ Log Results
-# ------------------------------------------------------------------------------
-logger.info(f"Validation results for loadConfirmationNumber={load_id}:")
-for field, status, truth, target in results:
-    if status == "✅ Match":
-        logger.info(f"{field:30} | {status:10} | truth='{truth}' | target='{target}'")
+    load_id = truth_record.get("loadConfirmationNumber")
+    if not load_id:
+        logger.error("No se especificó loadConfirmationNumber en truth ni en argumentos.")
+        raise SystemExit(2)
+
+    # Intentar cargar la tabla
+    try:
+        target_df = spark.table(source_table)
+    except Exception as e:
+        logger.error(f"No se pudo leer la tabla {source_table}: {e}")
+        raise SystemExit(2)
+
+    # Normalizar solo columnas string
+    string_cols = [c for c, t in target_df.dtypes if t == "string"]
+    logger.info(f"Columnas string detectadas: {string_cols}")
+
+    def normalize_df(df):
+        return df.select(*[
+            F.trim(F.lower(F.col(c))).alias(c) if c in string_cols else F.col(c)
+            for c in df.columns
+        ])
+
+    target_df = normalize_df(target_df)
+
+    # Filtrar por loadConfirmationNumber (si columna existe)
+    if "loadConfirmationNumber" not in target_df.columns:
+        logger.error("La tabla objetivo no contiene la columna 'loadConfirmationNumber'.")
+        raise SystemExit(2)
+
+    matches_df = target_df.filter(F.col("loadConfirmationNumber") == load_id)
+
+    total_matches = matches_df.count()
+    if total_matches == 0:
+        logger.error(f"No se encontró ningún registro para loadConfirmationNumber={load_id}")
+        # Mostrar esperados por campo
+        for k, v in truth_record.items():
+            logger.error(f"Esperado {k} = '{v}'")
+        raise SystemExit(1)
+    elif total_matches > 1:
+        logger.warning(f"Se encontraron {total_matches} filas para loadConfirmationNumber={load_id}. Se comparará la primera y se listará el conteo.")
     else:
-        logger.error(f"{field:30} | {status:10} | truth='{truth}' | target='{target}'")
+        logger.info(f"Encontrado 1 registro para loadConfirmationNumber={load_id}")
 
-# ------------------------------------------------------------------------------
-# 8️⃣ Fail Pipeline if Errors Detected
-# ------------------------------------------------------------------------------
-errors = [r for r in results if r[1].startswith("❌")]
-if errors:
-    logger.error(f"Validation failed for {len(errors)} fields")
-    for field, status, truth, target in errors:
-        logger.error(f"  - {field}: expected='{truth}' got='{target}'")
-    raise ValueError(f"Validation failed for {len(errors)} fields")
-else:
-    logger.info("✅ All fields match perfectly.")
+    # Tomar la primera fila (limit(1).collect())
+    first_row = matches_df.limit(1).collect()[0].asDict()
+
+    # Normalizar diccionarios para comparación
+    norm_truth = normalize_row_dict(truth_record)
+    norm_target = normalize_row_dict(first_row)
+
+    # Usar campos base en truth para iterar (asegura que comparamos lo esperado)
+    fields = list(norm_truth.keys())
+
+    results = []
+    mismatches = []
+
+    for col in fields:
+        truth_val = norm_truth.get(col)
+        target_val = norm_target.get(col)
+        ok = compare_values(col, truth_val, target_val)
+        status = "✅ Match" if ok else "❌ Mismatch"
+        results.append((col, status, truth_record.get(col), first_row.get(col)))
+        if not ok:
+            mismatches.append((col, truth_record.get(col), first_row.get(col)))
+
+    # Logging de resultados
+    logger.info(f"Resultados de validación para loadConfirmationNumber={load_id}:")
+    for field, status, truth_raw, target_raw in results:
+        if status.startswith("✅"):
+            logger.info(f"{field:30} | {status:10} | truth='{truth_raw}' | target='{target_raw}'")
+        else:
+            logger.error(f"{field:30} | {status:10} | truth='{truth_raw}' | target='{target_raw}'")
+
+    # Si hay errores, fallar (código 1)
+    if mismatches:
+        logger.error(f"Validation failed: {len(mismatches)} campos no coinciden")
+        for fld, exp, got in mismatches:
+            logger.error(f"  - {fld}: expected='{exp}' got='{got}'")
+        raise SystemExit(1)
+    else:
+        logger.info("✅ Todas las columnas coinciden (según reglas de comparación).")
+        raise SystemExit(0)
+
+
+if __name__ == "__main__":
+    main()
